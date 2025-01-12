@@ -1,13 +1,13 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-const url = process.env.NEXT_PUBLIC_API_URL;
+
 async function getAnalyticsData() {
   const [commitsPerBranch, mostActiveContributor, averageMergeTime] =
     await Promise.all([
-      fetch(`${url}api/analytics/commits-per-branch`).then((res) => res.json()),
-      fetch(`${url}api/analytics/most-active-contributor`).then((res) =>
+      fetch(`${process.env.NEXT_PUBLIC_API_URL}api/analytics/commits-per-branch`).then((res) => res.json()),
+      fetch(`${process.env.NEXT_PUBLIC_API_URL}api/analytics/most-active-contributor`).then((res) =>
         res.json()
       ),
-      fetch(`${url}api/analytics/average-merge-time`).then((res) => res.json()),
+      fetch(`${process.env.NEXT_PUBLIC_API_URL}api/analytics/average-merge-time`).then((res) => res.json()),
     ]);
 
   return { commitsPerBranch, mostActiveContributor, averageMergeTime };
@@ -16,7 +16,6 @@ async function getAnalyticsData() {
 export async function AnalyticsData() {
   const { commitsPerBranch, mostActiveContributor, averageMergeTime } =
     await getAnalyticsData();
-  console.log(url);
   return (
     <div className="flex gap-4 ">
       <Card>
