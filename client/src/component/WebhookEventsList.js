@@ -22,7 +22,7 @@ const WebhookEventsList = () => {
   const [events, setEvents] = useState([]);
 
   useEffect(() => {
-    fetch(`${url}api/webhook/events`)
+    fetch(`${process.env.NEXT_PUBLIC_API_URL}api/webhook/events`)
       .then((res) => res.json())
       .then((data) => {
         setEvents(data);
