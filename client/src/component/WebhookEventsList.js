@@ -22,20 +22,17 @@ const WebhookEventsList = () => {
   const [events, setEvents] = useState([]);
 
   useEffect(() => {
-    fetchWebhookEvents();
+    fetch(`${url}api/webhook/events`)
+      .then((res) => res.json())
+      .then((data) => {
+        setEvents(data);
+      })
+      .catch((error) => {
+        console.error(error);
+      });
   }, []);
 
-  const fetchWebhookEvents = async () => {
-    try {
-      const response = await axios.get(
-        "http://localhost:3000/api/webhook/events"
-      ); // Ensure this endpoint exists
-      setEvents(response.data);
-    } catch (error) {
-      console.error("Error fetching webhook events:", error);
-    }
-  };
-
+  console.log(events);
   return (
     <Card className="w-full">
       <CardHeader>
