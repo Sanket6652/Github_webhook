@@ -3,7 +3,24 @@ const crypto = require("crypto");
 const mongoose = require("mongoose");
 require("dotenv").config();
 const app = express();
-app.use(express.json());
+const cors = require("cors");
+const WebhookEvent = require("./models/webhookModel");
+const corsOptions = {
+  origin: "*",
+  methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
+  credentials: true,
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.use((req, res, next) => {
+  if (req.originalUrl === "/webhook/github") {
+    express.raw({ type: "application/json" })(req, res, next);
+  } else {
+    express.json()(req, res, next);
+  }
+});
+
 const moment = require("moment");
 // MongoDB Connection
 const port = process.env.PORT || 3000;
@@ -17,48 +34,39 @@ mongoose
   .then(() => console.log("Connected to MongoDB"))
   .catch((err) => console.error("MongoDB connection error:", err));
 
-// Models
-const Event = mongoose.model(
-  "Event",
-  new mongoose.Schema({
-    type: String,
-    payload: Object,
-    timestamp: Date,
-  })
-);
-
-const Commit = mongoose.model(
-  "Commit",
-  new mongoose.Schema({
-    branch: String,
-    message: String,
-    author: String,
-    timestamp: Date,
-  })
-);
-
-const PullRequest = mongoose.model(
-  "PullRequest",
-  new mongoose.Schema({
-    pr_id: Number,
-    title: String,
-    branch: String,
-    status: String,
-    created_at: Date,
-    merged_at: Date,
-  })
-);
+/// Middleware to parse JSON for all routes except /webhook/github
+app.use((req, res, next) => {
+  if (req.originalUrl === "/webhook/github") {
+    express.raw({ type: "application/json" })(req, res, next);
+  } else {
+    express.json()(req, res, next);
+  }
+});
 
 // Verify webhook signature
 // Middleware to validate GitHub signature
 function validateGithubSignature(req, res, next) {
   const signature = req.headers["x-hub-signature-256"];
-  const payload = JSON.stringify(req.body);
-  const hmac = crypto.createHmac("sha256", process.env.GITHUB_SECRET);
+  if (!signature) {
+    return res.status(400).send("Missing signature.");
+  }
+  if (!req.body) {
+    return res.status(400).send("Missing request body.");
+  }
+
+  const payload = req.body.toString("utf8");
+  const secret = process.env.GITHUB_SECRET;
+
+  if (!secret) {
+    console.error("GITHUB_SECRET is not defined.");
+    return res.status(500).send("Server configuration error.");
+  }
+
+  const hmac = crypto.createHmac("sha256", secret);
   const digest = `sha256=${hmac.update(payload).digest("hex")}`;
-  console.log(digest);
 
   if (signature !== digest) {
+    console.log("Invalid signature:", signature, digest);
     return res.status(401).send("Invalid signature.");
   }
 
@@ -66,113 +74,159 @@ function validateGithubSignature(req, res, next) {
 }
 
 // Webhook Endpoint
-app.post("/webhook/github", validateGithubSignature, async (req, res) => {
-  const eventType = req.headers["x-github-event"];
-  const payload = req.body;
-
-  try {
-    let eventDetails = { eventType };
-
-    if (eventType === "push") {
-      eventDetails = {
-        ...eventDetails,
-        branch: payload.ref.split("/").pop(),
-        Commit: payload.commits.map((commit) => ({
-          message: commit.message,
-          author: commit.author ? commit.author.name : "Unknown", // Safe check
-          timestamp: commit.timestamp || new Date(), // Use current timestamp if missing
-        })),
-      };
-    } else if (eventType === "pull_request") {
-      eventDetails = {
-        ...eventDetails,
-        branch: payload.pull_request.head.ref,
-        PullRequest: {
-          title: payload.pull_request.title,
-          author: payload.pull_request.user.login,
-          status: payload.pull_request.state,
-          createdAt: payload.pull_request.created_at,
-          mergedAt: payload.pull_request.merged_at,
-        },
-      };
+app.post(
+  "/webhook/github",
+  express.raw({ type: "application/json" }),
+  validateGithubSignature,
+  async (req, res) => {
+    const eventType = req.headers["x-github-event"];
+    let payload;
+    try {
+      payload = JSON.parse(req.body.toString("utf8"));
+    } catch (err) {
+      console.error("Error parsing JSON:", err);
+      return res.status(400).send("Invalid JSON.");
     }
+    try {
+      let eventDetails = { eventType };
 
-    // Save the event to MongoDB using Mongoose
-    const event = new Event(eventDetails); // Use the correct model name
-    await event.save();
+      if (eventType === "push") {
+        const { ref, commits } = payload;
+        const branchName = ref.split("/").pop();
+        const commitMessages = commits.map((commit) => ({
+          message: commit.message,
+          author: commit.author ? commit.author.name : "Unknown",
+          timestamp: commit.timestamp ? new Date(commit.timestamp) : new Date(),
+        }));
 
-    res.status(200).send(event);
-  } catch (error) {
-    console.error("Error processing webhook event:", error);
-    res.status(500).send("Internal Server Error");
+        eventDetails.branchName = branchName;
+        eventDetails.commitMessages = commitMessages;
+      } else if (eventType === "pull_request") {
+        eventDetails = {
+          ...eventDetails,
+          branch: payload.pull_request.head.ref,
+          PullRequest: {
+            title: payload.pull_request.title,
+            author: payload.pull_request.user.login,
+            status: payload.pull_request.state,
+            createdAt: new Date(payload.pull_request.created_at),
+            mergedAt: payload.pull_request.merged_at
+              ? new Date(payload.pull_request.merged_at)
+              : null,
+          },
+        };
+      }
+
+      // Save the event to MongoDB using Mongoose
+      const event = new WebhookEvent(eventDetails);
+      await event.save();
+      console.log(event);
+      res.status(200).send(event);
+    } catch (error) {
+      console.error("Error processing webhook event:", error);
+      res.status(500).send("Internal Server Error");
+    }
   }
-});
+);
 
-app.get("/analytics/commits", async (req, res) => {
+//Analytics Endpoint: Number of commits per branch in the last 7 days
+app.get("/api/analytics/commits-per-branch", async (req, res) => {
   try {
-    const sevenDaysAgo = moment().subtract(7, "days").toDate();
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
-    const commits = await Event.aggregate([
+    const commitsData = await WebhookEvent.aggregate([
+      { $match: { eventType: "push", createdAt: { $gte: sevenDaysAgo } } },
+      { $unwind: "$commitMessages" },
       {
-        $match: {
-          eventType: "push",
-          "commits.timestamp": { $gte: sevenDaysAgo },
+        $group: {
+          _id: "$branchName",
+          commitCount: { $sum: 1 },
         },
       },
-      { $unwind: "$commits" },
-      { $group: { _id: "$branch", count: { $sum: 1 } } },
+      { $sort: { commitCount: -1 } },
     ]);
 
-    res.json(commits);
+    res.status(200).json(commitsData);
   } catch (error) {
-    console.error("Error fetching commit analytics:", error);
+    console.error("Error fetching commits per branch:", error);
     res.status(500).send("Internal Server Error");
   }
 });
 
-app.get("/analytics/contributor", async (req, res) => {
+// Fetch all webhook events
+app.get("/api/webhook/events", async (req, res) => {
   try {
-    const contributors = await Event.aggregate([
-      { $match: { eventType: "push" } },
-      { $unwind: "$commits" },
-      { $group: { _id: "$commits.author", count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
+    const events = await WebhookEvent.find().sort({ createdAt: -1 });
+    console.log(events);
+    res.status(200).json(events);
+  } catch (error) {
+    console.error("Error fetching webhook events:", error);
+    res.status(500).send("Internal Server Error");
+  }
+});
+
+// Analytics Endpoint: Most active contributor based on commit frequency
+app.get("/api/analytics/most-active-contributor", async (req, res) => {
+  try {
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    const contributorsData = await WebhookEvent.aggregate([
+      { $match: { eventType: "push", createdAt: { $gte: sevenDaysAgo } } },
+      { $unwind: "$commitMessages" },
+      {
+        $group: {
+          _id: "$commitMessages.author",
+          commitCount: { $sum: 1 },
+        },
+      },
+      { $sort: { commitCount: -1 } },
       { $limit: 1 },
     ]);
 
-    res.json(contributors[0]);
+    if (contributorsData.length === 0) {
+      return res
+        .status(200)
+        .json({ message: "No contributors found in the last 7 days." });
+    }
+
+    res.status(200).json(contributorsData[0]);
   } catch (error) {
-    console.error("Error fetching contributor analytics:", error);
+    console.error("Error fetching most active contributor:", error);
     res.status(500).send("Internal Server Error");
   }
 });
 
-app.get("/analytics/prs", async (req, res) => {
+// Analytics Endpoint: Average time taken to merge pull requests
+app.get("/api/analytics/average-merge-time", async (req, res) => {
   try {
-    const pullRequests = await Event.aggregate([
-      {
-        $match: {
-          eventType: "pull_request",
-          "pullRequest.status": "closed",
-          "pullRequest.mergedAt": { $ne: null },
-        },
-      },
-      {
-        $project: {
-          timeToMerge: {
-            $subtract: [
-              { $toDate: "$pullRequest.mergedAt" },
-              { $toDate: "$pullRequest.createdAt" },
-            ],
-          },
-        },
-      },
-      { $group: { _id: null, averageTime: { $avg: "$timeToMerge" } } },
-    ]);
+    const mergedPRs = await WebhookEvent.find({
+      eventType: "pull_request",
+      "PullRequest.mergedAt": { $ne: null },
+    });
 
-    res.json({ averageTimeToMerge: pullRequests[0]?.averageTime || 0 });
+    if (mergedPRs.length === 0) {
+      return res
+        .status(200)
+        .json({ averageMergeTime: "No merged pull requests found." });
+    }
+
+    let totalTime = 0;
+    mergedPRs.forEach((pr) => {
+      const { createdAt, mergedAt } = pr.PullRequest;
+      const timeTaken = mergedAt - createdAt; // milliseconds
+      totalTime += timeTaken;
+    });
+
+    const averageTimeInMs = totalTime / mergedPRs.length;
+    const averageTimeInHours = averageTimeInMs / (1000 * 60 * 60);
+
+    res
+      .status(200)
+      .json({ averageMergeTimeInHours: averageTimeInHours.toFixed(2) });
   } catch (error) {
-    console.error("Error fetching PR analytics:", error);
+    console.error("Error calculating average merge time:", error);
     res.status(500).send("Internal Server Error");
   }
 });
