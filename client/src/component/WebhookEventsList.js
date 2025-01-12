@@ -36,7 +36,7 @@ const WebhookEventsList = () => {
   return (
     <Card className="w-full">
       <CardHeader>
-        <CardTitle>Webhook Events</CardTitle>
+        <CardTitle>Webhook Events </CardTitle>
       </CardHeader>
       <CardContent>
         <Table>
